@@ -139,7 +139,22 @@ _GLOBAL_RULES: list[MappingRule] = [
         factory=_rate_limit_error,
     ),
     MappingRule(
-        classifier=_message_contains("context length", "maximum context"),
+        # Providers phrase a context overflow several ways, and the two needles
+        # this rule used to carry missed the common ones: Anthropic says
+        # "prompt is too long", Ollama "too many tokens", and OpenAI-compatible
+        # proxies report that "input length and max_tokens exceed context
+        # limit" — a request whose *requested output* leaves no room in the
+        # window, which is the failure a stage with a large output reserve
+        # produces. Each needle here names that shape, not a transport problem.
+        classifier=_message_contains(
+            "context length",
+            "maximum context",
+            "context limit",
+            "context window",
+            "prompt is too long",
+            "input length",
+            "too many tokens",
+        ),
         factory=lambda exc, provider: ProviderContextWindowError(str(exc), provider=provider),
     ),
 ]

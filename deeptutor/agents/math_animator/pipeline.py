@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import time
 from typing import Any, Callable
 
+from deeptutor.agents._shared.history_budget import (
+    MIN_HISTORY_TOKENS,
+    MIN_OUTPUT_TOKENS,
+    PROMPT_OVERHEAD_TOKENS,
+    attachment_tokens,
+    count_text_tokens,
+    fit_history_context,
+    plan_stage_budget,
+)
 from deeptutor.core.context import Attachment
+from deeptutor.services.llm.config import get_llm_config
+from deeptutor.services.llm.exceptions import ProviderContextWindowError
 from deeptutor.services.model_selection.task_agent import task_model_agent
 
 from .agents import (
@@ -23,8 +35,25 @@ from .request_config import MathAnimatorRequestConfig
 from .retry_manager import CodeRetryManager
 from .visual_review import VisualReviewService
 
+logger = logging.getLogger(__name__)
+
 # Layout repair rounds checked before rendering (a dry run, seconds each).
 MAX_LAYOUT_ROUNDS = 3
+
+
+def _configured_context_window() -> int | None:
+    """The deployment's declared window, when it declares one.
+
+    Read lazily and defensively: a stage must be able to plan its prompt
+    before any settings file exists, and a missing declaration is the normal
+    case, not an error — :func:`plan_stage_budget` then falls back to the
+    model's known capacity.
+    """
+    try:
+        value = getattr(get_llm_config(), "context_window", None)
+    except Exception:
+        return None
+    return value if isinstance(value, int) and value > 0 else None
 
 
 class MathAnimatorPipeline:
@@ -109,13 +138,65 @@ class MathAnimatorPipeline:
         request_config: MathAnimatorRequestConfig,
         attachments: list[Attachment],
     ):
-        return await self.analysis_agent.process(
-            user_input=user_input,
-            history_context=history_context,
-            output_mode=request_config.output_mode,
-            style_hint=request_config.style_hint,
-            attachments=attachments,
+        """Plan the analysis call against the window this model can actually serve.
+
+        The history arriving here was budgeted for the *session*, against the
+        advertised window, and the analysis stage asks for the capability's
+        full output reserve on top of it. On a small or un-annotated model the
+        two together exceed the window and the provider refuses the request
+        before the model sees the prompt, so the turn dies with a
+        context-length error the user cannot act on. The reserve is taken
+        first, the history gets what is left, and the newest turns are kept.
+        """
+        budget = plan_stage_budget(
+            model=str(self.analysis_agent.get_model() or ""),
+            context_window=_configured_context_window(),
+            output_tokens=int(self.analysis_agent.get_max_tokens() or 0),
+            prompt_tokens=count_text_tokens(user_input) + PROMPT_OVERHEAD_TOKENS,
+            image_tokens=attachment_tokens(attachments),
         )
+        fitted = fit_history_context(history_context, budget.history_budget)
+        if fitted.dropped_blocks:
+            logger.warning(
+                "Math animator analysis history trimmed to %d tokens: dropped %d block(s) "
+                "(window %d, output reserve %d, prompt overhead %d).",
+                budget.history_budget,
+                fitted.dropped_blocks,
+                budget.window,
+                budget.output_tokens,
+                PROMPT_OVERHEAD_TOKENS,
+            )
+        try:
+            return await self.analysis_agent.process(
+                user_input=user_input,
+                history_context=fitted.text,
+                output_mode=request_config.output_mode,
+                style_hint=request_config.style_hint,
+                attachments=attachments,
+                max_tokens=budget.output_tokens,
+            )
+        except ProviderContextWindowError as exc:
+            # The window planned above is an estimate; the provider's refusal is
+            # the real limit. Give the turn one more attempt on the floor, with
+            # the current request and the newest turns only.
+            emergency = fit_history_context(history_context, MIN_HISTORY_TOKENS)
+            if emergency.text == fitted.text:
+                raise
+            logger.warning(
+                "Math animator analysis rejected by the provider (%s); retrying once with "
+                "%d tokens of history and a %d-token output reserve.",
+                exc,
+                MIN_HISTORY_TOKENS,
+                MIN_OUTPUT_TOKENS,
+            )
+            return await self.analysis_agent.process(
+                user_input=user_input,
+                history_context=emergency.text,
+                output_mode=request_config.output_mode,
+                style_hint=request_config.style_hint,
+                attachments=attachments,
+                max_tokens=MIN_OUTPUT_TOKENS,
+            )
 
     async def run_design(
         self,

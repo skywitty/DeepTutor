@@ -36,7 +36,15 @@ class ConceptAnalysisAgent(BaseAgent):
         output_mode: str,
         style_hint: str,
         attachments: list[Attachment],
+        max_tokens: int | None = None,
     ) -> ConceptAnalysis:
+        """Analyze one request, with the output reserve the caller budgeted.
+
+        ``max_tokens`` is the caller's share of the model window after the
+        prompt's own cost: the capability's configured reserve can exceed a
+        small window by itself, and the provider rejects the request before
+        the model sees it. ``None`` keeps the configured value.
+        """
         system_prompt = self.get_prompt("system")
         user_template = self.get_prompt("user_template")
         if not system_prompt or not user_template:
@@ -76,6 +84,7 @@ class ConceptAnalysisAgent(BaseAgent):
                 attachments=attachments,
                 response_format={"type": "json_object"},
                 reasoning_effort=reasoning_effort,
+                max_tokens=max_tokens,
                 stage="concept_analysis",
                 trace_meta=build_trace_metadata(
                     call_id=new_call_id("math-analysis"),
